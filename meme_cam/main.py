@@ -1,8 +1,11 @@
+import os
+import time
 import cv2
 import mediapipe as mp
 import math
 import numpy as np
 from collections import deque, Counter
+from PIL import Image
 
 mp_face  = mp.solutions.face_mesh
 mp_hands = mp.solutions.hands
@@ -26,10 +29,10 @@ def esc(lm):
 def px(pt, W, H):
     return (int(pt.x * W), int(pt.y * H))
 
-def dedos_estado(lm, izq=False):
+def finger_state(lm, is_left=False):
     tip = [8, 12, 16, 20]
     mid_j = [6, 10, 14, 18]
-    out = [1 if (lm[4].x > lm[3].x if izq else lm[4].x < lm[3].x) else 0]
+    out = [1 if (lm[4].x > lm[3].x if is_left else lm[4].x < lm[3].x) else 0]
 
     for t, m in zip(tip, mid_j):
         out.append(1 if lm[t].y < lm[m].y else 0)
@@ -87,15 +90,15 @@ class Cal:
         return min(len(self.buf['ci']) / self.N, 1.0)
 
 
-def det_lengua(lm, cal):
+def detect_tongue(lm, cal):
     e = esc(lm)
-    boca_abierta = d(lm[13], lm[14]) / e > cal.thr['lap']
-    lengua_baja = d(lm[17], lm[152]) / e < cal.thr['llb']
-    punta_fuera = lm[17].y > lm[14].y + 0.012
-    return boca_abierta and lengua_baja and punta_fuera
+    mouth_open = d(lm[13], lm[14]) / e > cal.thr['lap']
+    tongue_low = d(lm[17], lm[152]) / e < cal.thr['llb']
+    tip_out = lm[17].y > lm[14].y + 0.012
+    return mouth_open and tongue_low and tip_out
 
 
-def det_ceja(lm, cal):
+def detect_eyebrow(lm, cal):
     e = esc(lm)
     ci = d(lm[52], lm[159]) / e
     cd = d(lm[282], lm[386]) / e
@@ -114,34 +117,34 @@ def det_ceja(lm, cal):
     )
 
 
-def det_cristiano(manos, lm_cara):
-    boca = lm_cara[13]
+def detect_cristiano(manos, lm_cara):
+    mouth = lm_cara[13]
     return any(
-        d(lm[8], boca) < 0.09 or d(lm[12], boca) < 0.09
+        d(lm[8], mouth) < 0.09 or d(lm[12], mouth) < 0.09
         for _, lm in manos
     )
 
 
-def det_rata(ded):
+def detect_rat(ded):
     return ded == [0, 1, 1, 0, 0]
 
 
-def dedo_extendido(lm, tip, pip):
+def finger_extended(lm, tip, pip):
     return d2(lm[tip], lm[0]) > d2(lm[pip], lm[0]) * 1.18
 
 
-def indice_solo(lm):
+def index_only(lm):
     return (
-        dedo_extendido(lm, 8, 6) and
-        not dedo_extendido(lm, 12, 10) and
-        not dedo_extendido(lm, 16, 14) and
-        not dedo_extendido(lm, 20, 18)
+        finger_extended(lm, 8, 6) and
+        not finger_extended(lm, 12, 10) and
+        not finger_extended(lm, 16, 14) and
+        not finger_extended(lm, 20, 18)
     )
 
 
-def det_uwu(manos):
+def detect_uwu(manos):
     # 👉👈
-    if len(manos) != 2 or not all(indice_solo(lm) for _, lm in manos):
+    if len(manos) != 2 or not all(index_only(lm) for _, lm in manos):
         return False
 
     _, a = manos[0]
@@ -157,55 +160,55 @@ def det_uwu(manos):
     )
 
 
-def det_who_me(manos, lm_cara):
+def detect_who_me(manos, lm_cara):
     # Index finger pointing at your chest.
-    centro_x = lm_cara[9].x
-    ancho_cara = abs(lm_cara[454].x - lm_cara[234].x)
+    face_center_x = lm_cara[9].x
+    face_width = abs(lm_cara[454].x - lm_cara[234].x)
 
     for _, lm in manos:
-        if indice_solo(lm) and lm[8].y > lm_cara[152].y - 0.03:
-            if abs(lm[8].x - centro_x) < ancho_cara * 0.85:
+        if index_only(lm) and lm[8].y > lm_cara[152].y - 0.03:
+            if abs(lm[8].x - face_center_x) < face_width * 0.85:
                 return True
 
     return False
 
 
-def det_dimag(manos, lm_cara):
+def detect_dimag(manos, lm_cara):
     # Index finger near forehead or temple.
-    alto_cara = d2(lm_cara[10], lm_cara[152])
-    objetivos = [lm_cara[10], lm_cara[109], lm_cara[338]]
+    face_height = d2(lm_cara[10], lm_cara[152])
+    targets = [lm_cara[10], lm_cara[109], lm_cara[338]]
 
     for _, lm in manos:
-        if indice_solo(lm) and lm[8].y < lm_cara[9].y + alto_cara * 0.25:
-            if min(d2(lm[8], punto) for punto in objetivos) < alto_cara * 0.62:
+        if index_only(lm) and lm[8].y < lm_cara[9].y + face_height * 0.25:
+            if min(d2(lm[8], point) for point in targets) < face_height * 0.62:
                 return True
 
     return False
 
 
-def det_gato_dedo_medio(manos):
+def detect_cat_middle_finger(manos):
     # Middle finger up.
     for _, lm in manos:
         if (
-            dedo_extendido(lm, 12, 10) and
-            not dedo_extendido(lm, 8, 6) and
-            not dedo_extendido(lm, 16, 14) and
-            not dedo_extendido(lm, 20, 18)
+            finger_extended(lm, 12, 10) and
+            not finger_extended(lm, 8, 6) and
+            not finger_extended(lm, 16, 14) and
+            not finger_extended(lm, 20, 18)
         ):
             return True
 
     return False
 
 
-def det_monkey(manos, lm_cara):
+def detect_monkey(manos, lm_cara):
     if len(manos) != 2:
         return False
 
-    nariz_y = lm_cara[1].y
-    return all(lm[9].y < nariz_y for _, lm in manos)
+    nose_y = lm_cara[1].y
+    return all(lm[9].y < nose_y for _, lm in manos)
 
 
-def det_cara(manos):
+def detect_face(manos):
     if len(manos) != 2:
         return False
 
@@ -214,6 +217,15 @@ def det_cara(manos):
             return False
 
     return abs(manos[0][1][0].x - manos[1][1][0].x) >= 0.20
+
+
+def detect_left_thumb_left(lm):
+    return (
+        lm[4].x < lm[0].x - 0.08 and
+        lm[4].x < lm[3].x and
+        abs(lm[4].y - lm[3].y) < 0.12 and
+        abs(lm[8].x - lm[4].x) > 0.08
+    )
 
 
 HAND_CONNECTIONS = [
@@ -240,22 +252,43 @@ def draw_hand_minimal(frame, lm, W, H, ded):
             cv2.circle(frame, px(lm[tip], W, H), 3, (80, 240, 80), -1, cv2.LINE_AA)
 
 
-def hud(frame, img_actual, manos_info, W, H):
-    nombre = img_actual if img_actual else "neutral"
+def load_meme_asset(path):
+    if not os.path.exists(path):
+        return []
+
+    if path.lower().endswith('.gif'):
+        frames = []
+        try:
+            with Image.open(path) as img:
+                for i in range(getattr(img, 'n_frames', 1)):
+                    img.seek(i)
+                    rgba = img.convert('RGBA')
+                    bgr = cv2.cvtColor(np.asarray(rgba), cv2.COLOR_RGBA2BGR)
+                    frames.append(bgr)
+            return frames
+        except Exception:
+            pass
+
+    image = cv2.imread(path)
+    return [image] if image is not None else []
+
+
+def hud(frame, img_actual, hands_info, W, H):
+    label = img_actual if img_actual else "neutral"
     col = (80, 220, 80) if img_actual else (160, 160, 160)
 
     ov = frame.copy()
-    cv2.rectangle(ov, (8, 8), (min(W - 8, 14 + len(nombre) * 14 + 20), 36), (0, 0, 0), -1)
+    cv2.rectangle(ov, (8, 8), (min(W - 8, 14 + len(label) * 14 + 20), 36), (0, 0, 0), -1)
     cv2.addWeighted(ov, 0.5, frame, 0.5, 0, frame)
 
     cv2.putText(
-        frame, nombre, (14, 30),
+        frame, label, (14, 30),
         cv2.FONT_HERSHEY_SIMPLEX, 0.75, col, 2, cv2.LINE_AA
     )
 
-    for i, (lado, ded) in enumerate(manos_info):
+    for i, (side, ded) in enumerate(hands_info):
         cv2.putText(
-            frame, f"{lado}: {ded}", (14, 58 + 24 * i),
+            frame, f"{side}: {ded}", (14, 58 + 24 * i),
             cv2.FONT_HERSHEY_SIMPLEX, 0.55, (160, 160, 160), 1, cv2.LINE_AA
         )
 
@@ -267,7 +300,7 @@ def main():
         cap = cv2.VideoCapture(1, cv2.CAP_DSHOW)
 
     if not cap.isOpened():
-        print("Error: no se pudo abrir la camara")
+        print("Error: could not open the camera")
         return
 
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
@@ -279,7 +312,7 @@ def main():
 
     ret, frame0 = cap.read()
     if not ret:
-        print("Error: no se pudo leer frame inicial")
+        print("Error: could not read the initial frame")
         cap.release()
         return
 
@@ -310,8 +343,9 @@ def main():
 
         det = None
         lm_cara = None
-        manos = []
-        manos_info = []
+        hands = []
+        hands_info = []
+        left_thumb_left = False
 
         if not cal.done:
             pct = cal.progress
@@ -320,9 +354,17 @@ def main():
             cv2.addWeighted(ov, 0.55, frame, 0.45, 0, frame)
 
             cy = H // 2
+            text = "Look straight ahead"
+            (text_w, text_h), _ = cv2.getTextSize(
+                text,
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                2,
+            )
+            text_x = max(20, (W - text_w) // 2)
             cv2.putText(
-                frame, "Mira al frente cara neutral",
-                (W // 2 - 200, cy - 30),
+                frame, text,
+                (text_x, cy - 30),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.8,
                 (200, 200, 200), 2, cv2.LINE_AA
             )
@@ -336,9 +378,11 @@ def main():
             )
             cv2.rectangle(frame, (bx1, cy + 10), (bx2, cy + 28), (120, 120, 120), 1)
 
+            percent_text = f"{int(pct * 100)}%"
+            (p_w, _), _ = cv2.getTextSize(percent_text, cv2.FONT_HERSHEY_SIMPLEX, 0.65, 1)
             cv2.putText(
-                frame, f"{int(pct * 100)}%",
-                (W // 2 - 18, cy + 48),
+                frame, percent_text,
+                ((W - p_w) // 2, cy + 48),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.65,
                 (160, 160, 160), 1, cv2.LINE_AA
             )
@@ -359,66 +403,84 @@ def main():
         if hr.multi_hand_landmarks:
             for i, hl in enumerate(hr.multi_hand_landmarks):
                 lm = hl.landmark
-                izq = hr.multi_handedness[i].classification[0].label == "Left"
-                ded = dedos_estado(lm, izq)
+                is_left = hr.multi_handedness[i].classification[0].label == "Left"
+                ded = finger_state(lm, is_left)
+
+                if is_left and detect_left_thumb_left(lm):
+                    left_thumb_left = True
 
                 draw_hand_minimal(frame, lm, W, H, ded)
-                manos.append((ded, lm))
-                manos_info.append(("I" if izq else "D", ded))
+                hands.append((ded, lm))
+                hands_info.append(("I" if is_left else "D", ded))
 
-        if lm_cara and len(manos) == 2 and det_monkey(manos, lm_cara):
+        if left_thumb_left:
+            det = "giphy.gif" if os.path.exists("giphy.gif") else "cara.jpeg"
+        elif lm_cara and len(hands) == 2 and detect_monkey(hands, lm_cara):
             det = "monkey.jpg"
-        elif len(manos) == 2 and det_uwu(manos):
+        elif len(hands) == 2 and detect_uwu(hands):
             det = "uwu.jpg"
-        elif len(manos) == 2 and det_cara(manos):
+        elif len(hands) == 2 and detect_face(hands):
             det = "cara.jpeg"
-        elif lm_cara and manos and det_dimag(manos, lm_cara):
+        elif lm_cara and hands and detect_dimag(hands, lm_cara):
             det = "dimag.jpg"
-        elif lm_cara and manos and det_cristiano(manos, lm_cara):
+        elif lm_cara and hands and detect_cristiano(hands, lm_cara):
             det = "cristiano.png"
-        elif lm_cara and manos and det_who_me(manos, lm_cara):
+        elif lm_cara and hands and detect_who_me(hands, lm_cara):
             det = "who_me.jpg"
-        elif manos and det_gato_dedo_medio(manos):
+        elif hands and detect_cat_middle_finger(hands):
             det = "cat.jpg"
-        elif lm_cara and det_lengua(lm_cara, cal):
+        elif lm_cara and detect_tongue(lm_cara, cal):
             det = "gato1.png"
-        elif lm_cara and det_ceja(lm_cara, cal):
+        elif lm_cara and detect_eyebrow(lm_cara, cal):
             det = "perro.jpeg"
-        elif len(manos) == 1:
-            ded_m, lm_m = manos[0]
-            if det_rata(ded_m):
+        elif len(hands) == 1:
+            ded_m, lm_m = hands[0]
+            if detect_rat(ded_m):
                 det = "rata.jpeg"
 
         buf.append(det)
-        conteo = Counter(buf)
-        top, votos = conteo.most_common(1)[0]
+        count = Counter(buf)
+        top, votes = count.most_common(1)[0]
 
-        if votos >= MINVOTOS:
+        if votes >= MINVOTOS:
             img_actual = top
 
-        hud(frame, img_actual, manos_info, W, H)
+        hud(frame, img_actual, hands_info, W, H)
 
         display = frame.copy()
 
         if img_actual:
             if img_actual not in meme_cache:
-                meme_cache[img_actual] = cv2.imread(img_actual)
+                meme_cache[img_actual] = load_meme_asset(img_actual)
 
-            meme = meme_cache[img_actual]
+            frames = meme_cache[img_actual]
 
-            if meme is not None and meme.size > 0:
-                sw, sh = W // 3, H // 3
-                meme_small = cv2.resize(meme, (sw, sh))
+            if frames:
+                if len(frames) > 1:
+                    frame_idx = int(time.time() * 10) % len(frames)
+                    meme = frames[frame_idx]
+                else:
+                    meme = frames[0]
 
-                x1, x2 = W - sw - 10, W - 10
-                y1, y2 = H - sh - 10, H - 10
+                if meme is not None and meme.size > 0:
+                    sw, sh = W // 3, H // 3
+                    meme_small = cv2.resize(meme, (sw, sh))
 
-                cv2.rectangle(
-                    display, (x1 - 4, y1 - 4), (x2 + 4, y2 + 4),
-                    (0, 0, 0), -1
-                )
-                display[y1:y2, x1:x2] = meme_small
+                    x1, x2 = W - sw - 10, W - 10
+                    y1, y2 = H - sh - 10, H - 10
 
+                    cv2.rectangle(
+                        display, (x1 - 4, y1 - 4), (x2 + 4, y2 + 4),
+                        (0, 0, 0), -1
+                    )
+                    display[y1:y2, x1:x2] = meme_small
+
+                else:
+                    cv2.putText(
+                        display, f"Falta: {img_actual}", (20, H - 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                        (80, 80, 220), 2
+                    )
             else:
                 cv2.putText(
                     display, f"Falta: {img_actual}", (20, H - 20),
